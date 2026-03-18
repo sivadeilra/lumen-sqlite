@@ -20,12 +20,14 @@ use rusqlite::{Connection, MAIN_DB};
 use serde::Deserialize;
 use tracing::info;
 
+mod rpc;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
 /// An open database connection with its resolved file path.
-struct OpenDatabase {
+pub(crate) struct OpenDatabase {
     conn: Connection,
     path: PathBuf,
 }
@@ -47,13 +49,14 @@ pub struct LumenSqlite {
 }
 
 /// Allowed file extensions for database files.
-const ALLOWED_EXTENSIONS: &[&str] = &["db", "sqlite", "sqlite3"];
+pub(crate) const ALLOWED_EXTENSIONS: &[&str] = &["db", "sqlite", "sqlite3"];
 
 impl LumenSqlite {
-    pub fn new() -> Self {
-        let db_dir = std::env::var("LUMEN_SQLITE_DB_DIR")
+    pub fn new(db_dir_override: Option<String>) -> Self {
+        let db_dir = db_dir_override
+            .or_else(|| std::env::var("LUMEN_SQLITE_DB_DIR").ok())
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let db_dir = db_dir.canonicalize().unwrap_or_else(|_| db_dir.clone());
 
         let default_max_rows = std::env::var("LUMEN_SQLITE_MAX_ROWS")
@@ -189,7 +192,7 @@ impl LumenSqlite {
 // ---------------------------------------------------------------------------
 
 /// A JSON value that can be passed as a SQLite bound parameter.
-struct JsonParam(serde_json::Value);
+pub(crate) struct JsonParam(serde_json::Value);
 
 impl rusqlite::ToSql for JsonParam {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
@@ -219,8 +222,42 @@ fn value_ref_to_string(vr: ValueRef<'_>) -> String {
     }
 }
 
+/// Open a SQLite connection with WAL mode, foreign keys, and the REGEXP scalar
+/// function registered. Shared by MCP mode and `--rpc` mode.
+pub(crate) fn open_db_connection(db_path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(db_path)
+        .map_err(|e| format!("Failed to open database: {e}"))?;
+    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+    conn.create_scalar_function(
+        "regexp",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let pattern: Option<String> = ctx.get(0)?;
+            let text: Option<String> = ctx.get(1)?;
+            match (pattern, text) {
+                (Some(pat), Some(txt)) => {
+                    let re = Regex::new(&pat).map_err(|e| {
+                        rusqlite::Error::UserFunctionError(Box::new(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                e.to_string(),
+                            ),
+                        ))
+                    })?;
+                    Ok(re.is_match(&txt) as i64)
+                }
+                _ => Ok(0i64),
+            }
+        },
+    )
+    .map_err(|e| format!("Failed to register regexp UDF: {e}"))?;
+    Ok(conn)
+}
+
 /// Validate that a name is a safe SQL identifier.
-fn validate_identifier(name: &str, kind: &str) -> Result<(), String> {
+pub(crate) fn validate_identifier(name: &str, kind: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("Invalid {kind}: empty string is not allowed."));
     }
@@ -240,7 +277,7 @@ fn validate_identifier(name: &str, kind: &str) -> Result<(), String> {
 }
 
 /// Escape a SQL identifier for use inside double-quotes.
-fn escape_identifier(name: &str) -> String {
+pub(crate) fn escape_identifier(name: &str) -> String {
     name.replace('"', "\"\"")
 }
 
@@ -722,39 +759,10 @@ impl LumenSqlite {
         }
 
         let creating = !db_path.exists();
-        let conn = match Connection::open(&db_path) {
+        let conn = match open_db_connection(&db_path) {
             Ok(c) => c,
-            Err(e) => return format!("Failed to open database: {e}"),
+            Err(e) => return e,
         };
-
-        // Enable WAL mode and foreign keys
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
-
-        // Register REGEXP scalar function: text REGEXP pattern
-        // Returns 1 if pattern matches anywhere in text, 0 otherwise.
-        // NULL input yields NULL. Invalid patterns return an error.
-        conn.create_scalar_function(
-            "regexp",
-            2,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let pattern: Option<String> = ctx.get(0)?;
-                let text: Option<String> = ctx.get(1)?;
-                match (pattern, text) {
-                    (Some(pat), Some(txt)) => {
-                        let re = Regex::new(&pat).map_err(|e| {
-                            rusqlite::Error::UserFunctionError(Box::new(
-                                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-                            ))
-                        })?;
-                        Ok(re.is_match(&txt) as i64)
-                    }
-                    _ => Ok(0i64),
-                }
-            },
-        ).map_err(|e| format!("Failed to register regexp UDF: {e}"))
-         .unwrap_or(());
 
         let verb = if creating {
             "Created and opened"
@@ -2660,7 +2668,30 @@ const SERVER_INSTRUCTIONS: &str = include_str!("../instructions.md");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Log to stderr (stdout is the MCP transport)
+    // Parse command-line arguments manually.
+    // Switch to clap if argument handling grows more complex.
+    let mut rpc_mode = false;
+    let mut db_dir_override: Option<String> = None;
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--rpc" => rpc_mode = true,
+            "--db-dir" => match args.next() {
+                Some(dir) => db_dir_override = Some(dir),
+                None => {
+                    eprintln!("--db-dir requires a value");
+                    std::process::exit(1);
+                }
+            },
+            other => {
+                eprintln!("Unknown argument: {other}");
+                eprintln!("Usage: lumen-sqlite-mcp [--rpc] [--db-dir <dir>]");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Log to stderr — stdout is used by the MCP or RPC transport.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -2670,12 +2701,17 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    if rpc_mode {
+        rpc::run_rpc_server(db_dir_override);
+        return Ok(());
+    }
+
     info!(
         "lumen-sqlite MCP server starting (db_dir={})",
         std::env::var("LUMEN_SQLITE_DB_DIR").unwrap_or_else(|_| ".".into())
     );
 
-    let server = LumenSqlite::new();
+    let server = LumenSqlite::new(db_dir_override);
     let transport = rmcp::transport::io::stdio();
     let ct = server.serve(transport).await?;
     ct.waiting().await?;
