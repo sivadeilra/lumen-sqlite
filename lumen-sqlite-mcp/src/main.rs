@@ -20,6 +20,8 @@ use rusqlite::{Connection, MAIN_DB};
 use serde::Deserialize;
 use tracing::info;
 
+mod copilot_compat;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -3071,7 +3073,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let server = LumenSqlite::new();
-    let transport = rmcp::transport::io::stdio();
+    let transport = copilot_compat::CopilotDiscoveryTransport::new(
+        rmcp::transport::async_rw::AsyncRwTransport::new_server(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+        ),
+    );
     let ct = server.serve(transport).await?;
     ct.waiting().await?;
     Ok(())
