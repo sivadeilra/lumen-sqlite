@@ -12,7 +12,7 @@ use csv as csv_crate;
 use regex::Regex;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::schemars::JsonSchema;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
@@ -3032,10 +3032,10 @@ impl LumenSqlite {
 // MCP handler wiring
 // ---------------------------------------------------------------------------
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for LumenSqlite {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(SERVER_INSTRUCTIONS)
             .with_server_info(rmcp::model::Implementation::new(
                 "lumen-sqlite",
