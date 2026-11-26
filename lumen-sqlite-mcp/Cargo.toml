@@ -1,6 +1,6 @@
 [package]
 name = "lumen-sqlite-mcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "An MCP server for storing and manipulating structured data using SQLite"
 license = "MIT OR Apache-2.0"
@@ -14,7 +14,7 @@ chrono = "0.4"
 csv = "1"
 glob = "0.3"
 regex = "1"
-rmcp = { version = "1.2.0", features = ["server", "transport-io", "schemars"] }
+rmcp = { version = "3.11.0", features = ["server", "transport-io", "schemars"] }
 rusqlite = { version = "0.39.0", features = ["bundled-full"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
